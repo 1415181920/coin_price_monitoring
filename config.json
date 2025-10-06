@@ -1,0 +1,9 @@
+{
+  "proxy": {
+    "enabled": true,
+    "address": "http://127.0.0.1:7897",
+    "comment": "设置代理地址，如果enabled为false则不使用代理。留空则使用环境变量HTTP_PROXY"
+  },
+  "update_interval": 10,
+  "comment": "update_interval: 价格更新间隔（秒）"
+}
