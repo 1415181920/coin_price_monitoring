@@ -84,8 +84,8 @@
 ### 方式一：直接运行（推荐）
 
 1. **下载应用**
-   - 项目根目录下的 `coin_price_window.exe` 是已编译的可执行文件
-   - 双击即可运行
+   - [](https://github.com/1415181920/coin_price_monitoring/releases/latest) 获取最新版本(https://github.com/1415181920/coin_price_monitoring/releases) 是已编译的可执行文件
+   - 双击即可运行 其他平台的自己下载go编译
 
 2. **配置代理**（国内用户必须）
    - 在 exe 同目录下创建 `config.json` 文件
