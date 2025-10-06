@@ -19,8 +19,8 @@ func main() {
 	// Create application with options
 	err := wails.Run(&options.App{
 		Title:            "Crypto Prices",
-		Width:            150,
-		Height:           70,
+		Width:            100,
+		Height:           40,
 		Frameless:        true,
 		AlwaysOnTop:      true,
 		StartHidden:      false,
