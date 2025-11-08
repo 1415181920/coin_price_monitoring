@@ -2,8 +2,8 @@
   "proxy": {
     "enabled": true,
     "address": "http://127.0.0.1:7897",
-    "comment": "设置代理地址，如果enabled为false则不使用代理。留空则使用环境变量HTTP_PROXY"
+    "comment": "WebSocket代理配置，适用于Bitget API。如果enabled为false则不使用代理，留空则使用环境变量HTTP_PROXY"
   },
   "update_interval": 10,
-  "comment": "update_interval: 价格更新间隔（秒）"
+  "comment": "update_interval已弃用（保留用于兼容性），WebSocket为实时推送，无需设置更新间隔"
 }

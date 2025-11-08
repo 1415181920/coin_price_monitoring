@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -19,7 +20,7 @@ type Config struct {
 		Enabled bool   `json:"enabled"`
 		Address string `json:"address"`
 	} `json:"proxy"`
-	UpdateInterval int `json:"update_interval"`
+	UpdateInterval int `json:"update_interval"` // 已弃用，保留用于兼容性
 }
 
 // App struct
@@ -29,12 +30,39 @@ type App struct {
 	ethPrice   string
 	lastUpdate time.Time
 	config     *Config
+	wsConn     *websocket.Conn
+	mu         sync.RWMutex // 保护价格数据
+	reconnect  chan bool    // 重连信号
 }
 
-// BinancePrice 币安API响应结构
-type BinancePrice struct {
-	Symbol string `json:"symbol"`
-	Price  string `json:"price"`
+// BitgetTickerData Bitget Ticker数据结构
+type BitgetTickerData struct {
+	InstId    string `json:"instId"`    // 交易对ID
+	LastPr    string `json:"lastPr"`    // 最新价格
+	BidPr     string `json:"bidPr"`     // 最优买价
+	AskPr     string `json:"askPr"`     // 最优卖价
+	High24h   string `json:"high24h"`   // 24小时最高价
+	Low24h    string `json:"low24h"`    // 24小时最低价
+	Change24h string `json:"change24h"` // 24小时涨跌幅
+}
+
+// BitgetWSMessage WebSocket消息结构
+type BitgetWSMessage struct {
+	Op     string               `json:"op,omitempty"`     // 操作类型：subscribe/ping/pong
+	Event  string               `json:"event,omitempty"`  // 事件类型：subscribe
+	Args   []BitgetSubscribeArg `json:"args,omitempty"`   // 订阅参数
+	Action string               `json:"action,omitempty"` // 动作：snapshot/update
+	Arg    *BitgetSubscribeArg  `json:"arg,omitempty"`    // 推送的订阅信息
+	Data   []BitgetTickerData   `json:"data,omitempty"`   // Ticker数据
+	Code   string               `json:"code,omitempty"`   // 响应代码
+	Msg    string               `json:"msg,omitempty"`    // 响应消息
+}
+
+// BitgetSubscribeArg 订阅参数
+type BitgetSubscribeArg struct {
+	InstType string `json:"instType"` // 产品类型：USDT-FUTURES
+	Channel  string `json:"channel"`  // 频道：ticker
+	InstId   string `json:"instId"`   // 交易对：BTCUSDT
 }
 
 // PriceData 价格数据结构
@@ -47,7 +75,7 @@ type PriceData struct {
 // loadConfig 加载配置文件
 func loadConfig() *Config {
 	config := &Config{
-		UpdateInterval: 10, // 默认10秒
+		UpdateInterval: 10, // 保留用于兼容性，WebSocket为实时推送
 	}
 	config.Proxy.Enabled = true
 	config.Proxy.Address = "http://127.0.0.1:7897" // 默认Clash端口
@@ -70,63 +98,27 @@ func loadConfig() *Config {
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{
-		btcPrice: "加载中...",
-		ethPrice: "加载中...",
-		config:   loadConfig(),
+		btcPrice:  "加载中...",
+		ethPrice:  "加载中...",
+		config:    loadConfig(),
+		reconnect: make(chan bool, 1),
 	}
 }
 
-// getHTTPClient 创建支持代理的HTTP客户端
-func (a *App) getHTTPClient() *http.Client {
-	transport := &http.Transport{}
-
-	// 代理优先级：
-	// 1. 环境变量 HTTP_PROXY / HTTPS_PROXY
-	// 2. 配置文件中的代理设置
-	// 3. 不使用代理
-
-	if proxyEnv := os.Getenv("HTTP_PROXY"); proxyEnv != "" {
-		// 优先使用环境变量
-		if proxyURL, err := url.Parse(proxyEnv); err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			fmt.Printf("✓ 使用环境变量代理: %s\n", proxyEnv)
-		}
-	} else if proxyEnv := os.Getenv("HTTPS_PROXY"); proxyEnv != "" {
-		if proxyURL, err := url.Parse(proxyEnv); err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			fmt.Printf("✓ 使用环境变量代理: %s\n", proxyEnv)
-		}
-	} else if a.config != nil && a.config.Proxy.Enabled && a.config.Proxy.Address != "" {
-		// 使用配置文件中的代理
-		if proxyURL, err := url.Parse(a.config.Proxy.Address); err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			fmt.Printf("✓ 使用配置代理: %s\n", a.config.Proxy.Address)
-		} else {
-			fmt.Printf("✗ 代理地址解析失败: %s\n", a.config.Proxy.Address)
-		}
-	} else {
-		fmt.Println("⚠ 未配置代理，直连币安API（国内可能无法访问）")
-	}
-
-	return &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: transport,
-	}
-}
-
-// startup is called when the app starts. The context is saved
-// so we can call the runtime methods
+// startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	
-	// 启动时立即获取一次价格
-	go a.fetchPrices()
-	// 启动定时器，每10秒更新一次价格
-	go a.startPriceUpdater()
+
+	fmt.Println("启动 Bitget WebSocket 连接...")
+	// 启动WebSocket连接
+	go a.startWebSocket()
 }
 
 // GetPrices 获取当前价格（供前端调用）
 func (a *App) GetPrices() PriceData {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
 	return PriceData{
 		BTC:        a.btcPrice,
 		ETH:        a.ethPrice,
@@ -134,95 +126,256 @@ func (a *App) GetPrices() PriceData {
 	}
 }
 
-// fetchPrice 从币安API获取指定币种价格
-func (a *App) fetchPrice(symbol string) (string, error) {
-	// 使用支持代理的HTTP客户端
-	client := a.getHTTPClient()
+// startWebSocket 启动WebSocket连接（包含重连逻辑）
+func (a *App) startWebSocket() {
+	retryDelay := 1 * time.Second
+	maxRetryDelay := 30 * time.Second
 
-	apiURL := fmt.Sprintf("https://api.binance.com/api/v3/ticker/price?symbol=%s", symbol)
-	resp, err := client.Get(apiURL)
-	if err != nil {
-		return "", fmt.Errorf("请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("读取失败: %w", err)
-	}
-
-	var priceData BinancePrice
-	if err := json.Unmarshal(body, &priceData); err != nil {
-		return "", fmt.Errorf("解析失败: %w", err)
-	}
-
-	// 格式化价格
-	price := priceData.Price
-	if len(price) > 3 {
-		// 截取整数部分和2位小数
-		dotIndex := -1
-		for i, c := range price {
-			if c == '.' {
-				dotIndex = i
-				break
-			}
+	for {
+		err := a.connectAndListen()
+		if err != nil {
+			fmt.Printf("WebSocket连接错误: %v\n", err)
 		}
-		if dotIndex != -1 && dotIndex+3 < len(price) {
-			price = price[:dotIndex+3]
+
+		// 检查是否需要退出
+		select {
+		case <-a.ctx.Done():
+			fmt.Println("应用退出，关闭WebSocket连接")
+			return
+		default:
 		}
-	}
 
-	return price, nil
-}
+		// 指数退避重连
+		fmt.Printf("将在 %v 后重连...\n", retryDelay)
+		time.Sleep(retryDelay)
 
-// fetchPrices 获取所有价格
-func (a *App) fetchPrices() {
-	// 获取BTC价格
-	btcPrice, err := a.fetchPrice("BTCUSDT")
-	if err != nil {
-		fmt.Printf("获取BTC价格失败: %v\n", err)
-		a.btcPrice = "N/A"
-	} else {
-		a.btcPrice = btcPrice
-		fmt.Printf("BTC价格: $%s\n", btcPrice)
-	}
-
-	// 获取ETH价格
-	ethPrice, err := a.fetchPrice("ETHUSDT")
-	if err != nil {
-		fmt.Printf("获取ETH价格失败: %v\n", err)
-		a.ethPrice = "N/A"
-	} else {
-		a.ethPrice = ethPrice
-		fmt.Printf("ETH价格: $%s\n", ethPrice)
-	}
-
-	a.lastUpdate = time.Now()
-
-	// 发送事件到前端更新UI
-	if a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "price-update", a.GetPrices())
-		
-		// 更新窗口标题
-		title := fmt.Sprintf("BTC: $%s | ETH: $%s", a.btcPrice, a.ethPrice)
-		runtime.WindowSetTitle(a.ctx, title)
+		retryDelay *= 2
+		if retryDelay > maxRetryDelay {
+			retryDelay = maxRetryDelay
+		}
 	}
 }
 
-// startPriceUpdater 启动价格更新定时器
-func (a *App) startPriceUpdater() {
-	interval := time.Duration(a.config.UpdateInterval) * time.Second
-	ticker := time.NewTicker(interval)
+// connectAndListen 连接WebSocket并监听消息
+func (a *App) connectAndListen() error {
+	// 创建WebSocket拨号器
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = 10 * time.Second
+
+	// 配置代理
+	if a.config != nil && a.config.Proxy.Enabled && a.config.Proxy.Address != "" {
+		proxyURL, err := url.Parse(a.config.Proxy.Address)
+		if err != nil {
+			fmt.Printf("✗ 代理地址解析失败: %s\n", a.config.Proxy.Address)
+		} else {
+			dialer.Proxy = http.ProxyURL(proxyURL)
+			fmt.Printf("✓ 使用代理连接WebSocket: %s\n", a.config.Proxy.Address)
+		}
+	} else if proxyEnv := os.Getenv("HTTP_PROXY"); proxyEnv != "" {
+		if proxyURL, err := url.Parse(proxyEnv); err == nil {
+			dialer.Proxy = http.ProxyURL(proxyURL)
+			fmt.Printf("✓ 使用环境变量代理: %s\n", proxyEnv)
+		}
+	} else if proxyEnv := os.Getenv("HTTPS_PROXY"); proxyEnv != "" {
+		if proxyURL, err := url.Parse(proxyEnv); err == nil {
+			dialer.Proxy = http.ProxyURL(proxyURL)
+			fmt.Printf("✓ 使用环境变量代理: %s\n", proxyEnv)
+		}
+	} else {
+		fmt.Println("⚠ 未配置代理，直连Bitget API（国内可能需要代理）")
+	}
+
+	// 连接到Bitget WebSocket
+	wsURL := "wss://ws.bitget.com/v2/ws/public"
+	conn, _, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		return fmt.Errorf("连接WebSocket失败: %w", err)
+	}
+
+	a.mu.Lock()
+	a.wsConn = conn
+	a.mu.Unlock()
+
+	fmt.Printf("✓ 已连接到 Bitget WebSocket: %s\n", wsURL)
+
+	// 订阅ticker频道
+	if err := a.subscribeToTickers(); err != nil {
+		conn.Close()
+		return fmt.Errorf("订阅失败: %w", err)
+	}
+
+	// 启动心跳
+	go a.startHeartbeat()
+
+	// 监听消息
+	return a.handleWebSocketMessages()
+}
+
+// subscribeToTickers 订阅BTC和ETH的ticker数据
+func (a *App) subscribeToTickers() error {
+	subscribeMsg := BitgetWSMessage{
+		Op: "subscribe",
+		Args: []BitgetSubscribeArg{
+			{
+				InstType: "USDT-FUTURES",
+				Channel:  "ticker",
+				InstId:   "BTCUSDT",
+			},
+			{
+				InstType: "USDT-FUTURES",
+				Channel:  "ticker",
+				InstId:   "ETHUSDT",
+			},
+		},
+	}
+
+	a.mu.RLock()
+	conn := a.wsConn
+	a.mu.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("WebSocket连接未建立")
+	}
+
+	err := conn.WriteJSON(subscribeMsg)
+	if err != nil {
+		return fmt.Errorf("发送订阅消息失败: %w", err)
+	}
+
+	fmt.Println("✓ 已订阅 BTCUSDT 和 ETHUSDT ticker频道")
+	return nil
+}
+
+// startHeartbeat 启动心跳维持连接
+func (a *App) startHeartbeat() {
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
-	fmt.Printf("✓ 价格更新间隔: %d秒\n", a.config.UpdateInterval)
 
 	for {
 		select {
 		case <-ticker.C:
-			a.fetchPrices()
+			a.mu.RLock()
+			conn := a.wsConn
+			a.mu.RUnlock()
+
+			if conn == nil {
+				return
+			}
+
+			pingMsg := map[string]string{"op": "ping"}
+			err := conn.WriteJSON(pingMsg)
+			if err != nil {
+				fmt.Printf("发送心跳失败: %v\n", err)
+				return
+			}
+
 		case <-a.ctx.Done():
 			return
 		}
 	}
+}
+
+// handleWebSocketMessages 处理WebSocket消息
+func (a *App) handleWebSocketMessages() error {
+	a.mu.RLock()
+	conn := a.wsConn
+	a.mu.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("WebSocket连接未建立")
+	}
+
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("读取消息失败: %w", err)
+		}
+
+		var wsMsg BitgetWSMessage
+		if err := json.Unmarshal(message, &wsMsg); err != nil {
+			fmt.Printf("解析消息失败: %v\n", err)
+			continue
+		}
+
+		// 处理不同类型的消息
+		switch {
+		case wsMsg.Op == "pong":
+			// 心跳响应，静默处理
+			continue
+
+		case wsMsg.Event == "subscribe":
+			// 订阅响应
+			if wsMsg.Arg != nil {
+				fmt.Printf("✓ 订阅成功: %s %s\n", wsMsg.Arg.InstId, wsMsg.Arg.Channel)
+			}
+
+		case wsMsg.Code != "":
+			// 错误响应
+			if wsMsg.Code == "0" {
+				fmt.Printf("✓ 操作成功\n")
+			} else {
+				fmt.Printf("✗ 操作失败: %s - %s\n", wsMsg.Code, wsMsg.Msg)
+			}
+
+		case wsMsg.Action == "snapshot" || wsMsg.Action == "update":
+			// Ticker数据推送
+			a.handleTickerData(&wsMsg)
+		}
+	}
+}
+
+// handleTickerData 处理ticker数据更新
+func (a *App) handleTickerData(wsMsg *BitgetWSMessage) {
+	if len(wsMsg.Data) == 0 {
+		return
+	}
+
+	for _, ticker := range wsMsg.Data {
+		price := a.formatPrice(ticker.LastPr)
+
+		a.mu.Lock()
+		switch ticker.InstId {
+		case "BTCUSDT":
+			a.btcPrice = price
+			fmt.Printf("BTC价格更新: $%s\n", price)
+		case "ETHUSDT":
+			a.ethPrice = price
+			fmt.Printf("ETH价格更新: $%s\n", price)
+		}
+		a.lastUpdate = time.Now()
+		a.mu.Unlock()
+	}
+
+	// 发送事件到前端更新UI
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "price-update", a.GetPrices())
+
+		// 更新窗口标题
+		a.mu.RLock()
+		title := fmt.Sprintf("BTC: $%s | ETH: $%s", a.btcPrice, a.ethPrice)
+		a.mu.RUnlock()
+		runtime.WindowSetTitle(a.ctx, title)
+	}
+}
+
+// formatPrice 格式化价格（保留2位小数）
+func (a *App) formatPrice(price string) string {
+	if price == "" {
+		return "N/A"
+	}
+
+	// 截取整数部分和2位小数
+	dotIndex := -1
+	for i, c := range price {
+		if c == '.' {
+			dotIndex = i
+			break
+		}
+	}
+
+	if dotIndex != -1 && dotIndex+3 < len(price) {
+		return price[:dotIndex+3]
+	}
+
+	return price
 }
